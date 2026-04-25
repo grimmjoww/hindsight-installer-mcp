@@ -23,6 +23,9 @@ This server gives any MCP-compatible agent (Claude Code, Cursor, Cline, Continue
 | `migrate_embeddings` | Wraps `hindsight-admin reindex-embeddings` with optional auto-backup + verify-recall |
 | `verify_recall` | Standalone recall self-match sanity check |
 | `upgrade_embedding_pipeline` | Orchestrator: backup → set env → emit ALTER SQL → migrate → verify |
+| `check_hindsight_update` | Compare installed vs latest Hindsight, consult compat manifest, advise |
+| `validate_compatibility` | CLI surface + dry-run + API health probes before upgrading |
+| `safe_upgrade_hindsight` | Backup → pre-flight → pip upgrade → post-flight verify → rollback on failure |
 
 ## Install
 
@@ -100,9 +103,23 @@ When `mode: "pg0"`: no elevation ever — pg0 lives entirely in `~/.pg0/`, fully
 
 Hindsight has its own admin CLI ([`hindsight-admin`](https://github.com/vectorize-io/hindsight/blob/main/hindsight-api-slim/hindsight_api/admin/cli.py)). Some of these tools (`migrate_embeddings`, `verify_recall`) are thin wrappers around it. The pieces that *don't* belong upstream — extension install with elevation routing, env-file mutation, agent-friendly orchestration — live here. This MCP is the agent surface; upstream Hindsight is the engine.
 
+## Safe-upgrade workflow
+
+When Hindsight ships a new version, your agent can do the whole "is this safe?" dance for you:
+
+```
+agent prompt: "Is there a Hindsight update? If so, upgrade safely."
+```
+
+1. `check_hindsight_update` — fetches latest from PyPI, consults the published [compat.json](./compat.json) matrix. Returns: status (ok / warn / block), advisories, recommendation.
+2. `validate_compatibility` — pre-flight probes: are the CLI flags this MCP relies on still present (`--auto-backup`, `--verify-recall`, etc.)? Does `reindex-embeddings --dry-run` succeed against your DB? Is the API healthy?
+3. `safe_upgrade_hindsight` — full reversible upgrade: backup → pre-flight → `pip install -U` → post-flight → if anything fails, `pip install old-version` rollback. Backup file remains regardless.
+
+The compat matrix lives in this repo at [compat.json](./compat.json) and is fetched from raw GitHub at runtime — so updates to "what's compatible" can be PR'd independently of MCP code releases.
+
 ## Status & maintenance
 
-**v0.1 — alpha, lazily maintained.** Core install + upgrade workflows tested on Windows 11 + Postgres 17.
+**v0.2 — alpha, lazily maintained.** Core install + upgrade workflows tested on Windows 11 + Postgres 17.
 
 This is a side-project glue layer between agents and Hindsight. I patch it when it bites me; PRs welcome but I'm not on a release schedule. If something breaks for you and there's no obvious fix:
 

@@ -1,6 +1,6 @@
 [project]
 name = "hindsight-installer-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Model Context Protocol server for installing Postgres extensions and upgrading embedding pipelines on Hindsight — works with Claude Code, Cursor, Cline, Continue, OpenAI Codex, Gemini CLI, or any MCP-compatible agent."
 readme = "README.md"
 requires-python = ">=3.11"

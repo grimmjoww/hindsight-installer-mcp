@@ -1,0 +1,23 @@
+{
+  "$schema_version": 1,
+  "_comment": "Compatibility matrix for hindsight-installer-mcp. Updated when new Hindsight versions are tested. Live URL: https://raw.githubusercontent.com/grimmjoww/hindsight-installer-mcp/main/compat.json",
+  "mcp_version": "0.1.0",
+  "tested_against": [
+    {
+      "hindsight_version": "0.5.4",
+      "status": "verified",
+      "reindex_embeddings_cli": "stable",
+      "notes": "Reindex-embeddings command, halfvec discovery, vchord support all work."
+    }
+  ],
+  "minimum_supported_hindsight": "0.5.0",
+  "maximum_known_safe_hindsight": "0.5.99",
+  "known_breaks": [],
+  "known_advisories": [
+    {
+      "applies_to": "<0.5.0",
+      "severity": "block",
+      "message": "reindex-embeddings command was added in PR #1258 (targeting 0.5.x). Pre-0.5.0 Hindsight does not have it."
+    }
+  ]
+}

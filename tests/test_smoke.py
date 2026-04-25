@@ -91,5 +91,38 @@ def test_set_hindsight_env_replaces_existing_key(tmp_path):
     assert "OTHER=keep" in contents
 
 
+def test_semver_tuple_parses_basic():
+    from hindsight_installer_mcp.server import _semver_tuple
+
+    assert _semver_tuple("0.5.4") == (0, 5, 4)
+    assert _semver_tuple("1.0.0-alpha") == (1, 0, 0)
+    assert _semver_tuple("2.3.4+build.123") == (2, 3, 4)
+    assert _semver_tuple("garbage") == (0,)
+
+
+def test_matches_pattern_basic():
+    from hindsight_installer_mcp.server import _matches_pattern
+
+    assert _matches_pattern("0.5.4", "0.5.x")
+    assert not _matches_pattern("0.6.0", "0.5.x")
+    assert _matches_pattern("0.4.9", "<0.5.0")
+    assert _matches_pattern("0.5.4", ">=0.5.0")
+    assert _matches_pattern("0.5.4", "0.5.4")
+    assert not _matches_pattern("0.5.5", "==0.5.4")
+
+
+def test_check_hindsight_update_returns_structured_dict_offline():
+    """Smoke test: function returns a dict with the expected shape even if PyPI/manifest fetches fail."""
+    from hindsight_installer_mcp.server import check_hindsight_update
+
+    result = check_hindsight_update()
+    # We don't assert on `latest` because that depends on network
+    assert "ok" in result
+    if result.get("ok"):
+        assert "installed" in result
+        assert "compatibility" in result
+        assert "recommendation" in result
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -14,6 +14,9 @@ Tools provided:
   migrate_embeddings    — invoke `hindsight-admin reindex-embeddings`
   verify_recall         — sanity-check the embedding pipeline
   upgrade_embedding_pipeline — orchestrator: install ext → set env → restart → migrate → verify
+  check_hindsight_update     — is a new Hindsight release out, is it compatible
+  validate_compatibility     — pre-update health check + CLI surface diff
+  safe_upgrade_hindsight     — backup → pre-flight → upgrade → verify → rollback on failure
 
 Works with any MCP-compatible agent (Claude Code, Cursor, Cline, Continue, Codex, Gemini CLI, etc.).
 """
@@ -723,6 +726,409 @@ def upgrade_embedding_pipeline(
             "3. Restart Hindsight (it will load the new embedding model).",
             "4. Call `migrate_embeddings(schema=..., auto_backup_path=..., verify_recall=true)` to re-encode.",
         ],
+    }
+
+
+# ─── Tool: check_hindsight_update ─────────────────────────────────────────────
+
+
+COMPAT_MANIFEST_URL = "https://raw.githubusercontent.com/grimmjoww/hindsight-installer-mcp/main/compat.json"
+PYPI_HINDSIGHT_API = "https://pypi.org/pypi/hindsight-api/json"
+
+
+def _installed_hindsight_version() -> str | None:
+    """Best-effort detection of the locally installed Hindsight version."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            return version("hindsight-api")
+        except PackageNotFoundError:
+            pass
+        try:
+            return version("hindsight-api-slim")
+        except PackageNotFoundError:
+            pass
+    except Exception:
+        pass
+    # Fallback: ask hindsight-admin
+    admin = shutil.which("hindsight-admin")
+    if admin:
+        try:
+            out = subprocess.check_output([admin, "--version"], text=True, timeout=5).strip()
+            for tok in out.split():
+                if tok and tok[0].isdigit():
+                    return tok
+        except Exception:
+            pass
+    return None
+
+
+def _semver_tuple(v: str) -> tuple[int, ...]:
+    """Crude semver parse: '0.5.4' → (0, 5, 4). Pre-release suffixes truncated."""
+    main = v.split("-")[0].split("+")[0]
+    parts = []
+    for p in main.split("."):
+        try:
+            parts.append(int(p))
+        except ValueError:
+            break
+    return tuple(parts) or (0,)
+
+
+def _matches_pattern(version: str, pattern: str) -> bool:
+    """Simple version-pattern matcher: '0.5.x', '<0.5.0', '>=0.5.4'."""
+    pattern = pattern.strip()
+    v_tuple = _semver_tuple(version)
+    if pattern.endswith(".x"):
+        prefix = _semver_tuple(pattern[:-2])
+        return v_tuple[: len(prefix)] == prefix
+    for op in ("<=", ">=", "<", ">", "=="):
+        if pattern.startswith(op):
+            target = _semver_tuple(pattern[len(op) :].strip())
+            if op == "<":
+                return v_tuple < target
+            if op == "<=":
+                return v_tuple <= target
+            if op == ">":
+                return v_tuple > target
+            if op == ">=":
+                return v_tuple >= target
+            if op == "==":
+                return v_tuple == target
+    return v_tuple == _semver_tuple(pattern)
+
+
+@mcp.tool()
+def check_hindsight_update() -> dict[str, Any]:
+    """Check whether a newer Hindsight release is available and whether it's
+    flagged compatible with this MCP version per the published compat matrix.
+
+    Returns:
+        {
+            installed: <current local version or null>,
+            latest: <latest version on PyPI>,
+            update_available: bool,
+            compatibility: { status, severity, message, advisories[] },
+            recommendation: human-readable
+        }
+    """
+    installed = _installed_hindsight_version()
+
+    latest: str | None = None
+    try:
+        r = httpx.get(PYPI_HINDSIGHT_API, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            latest = data.get("info", {}).get("version")
+    except httpx.HTTPError as e:
+        return {
+            "ok": False,
+            "error": f"Could not reach PyPI to check latest version: {e!r}",
+            "installed": installed,
+        }
+
+    manifest: dict[str, Any] = {}
+    try:
+        r = httpx.get(COMPAT_MANIFEST_URL, timeout=8)
+        if r.status_code == 200:
+            manifest = r.json()
+    except httpx.HTTPError:
+        manifest = {}
+
+    update_available = False
+    if installed and latest:
+        update_available = _semver_tuple(latest) > _semver_tuple(installed)
+
+    advisories: list[dict[str, Any]] = []
+    severity = "ok"
+    message = "No advisories. Update is safe per current compat matrix."
+
+    target = latest or installed
+    if target and manifest:
+        min_supported = manifest.get("minimum_supported_hindsight")
+        if min_supported and _semver_tuple(target) < _semver_tuple(min_supported):
+            severity = "block"
+            message = f"Hindsight {target} is below minimum_supported {min_supported}."
+        max_safe = manifest.get("maximum_known_safe_hindsight")
+        if max_safe and _semver_tuple(target) > _semver_tuple(max_safe):
+            severity = "warn"
+            message = (
+                f"Hindsight {target} is newer than maximum_known_safe {max_safe}. "
+                "Untested with this MCP version. Run validate_compatibility before upgrading."
+            )
+        for adv in manifest.get("known_advisories", []):
+            pat = adv.get("applies_to", "")
+            if pat and _matches_pattern(target, pat):
+                advisories.append(adv)
+                if adv.get("severity") == "block":
+                    severity = "block"
+                    message = adv.get("message", message)
+
+    rec_parts = []
+    if not installed:
+        rec_parts.append("Hindsight does not appear to be installed in this environment.")
+    elif update_available and severity == "block":
+        rec_parts.append(f"DO NOT update yet — {message}")
+    elif update_available and severity == "warn":
+        rec_parts.append(f"Update available ({installed} → {latest}) but proceed with caution: {message}")
+        rec_parts.append("Recommended: run `validate_compatibility` then `safe_upgrade_hindsight`.")
+    elif update_available:
+        rec_parts.append(
+            f"Update available ({installed} → {latest}). Use `safe_upgrade_hindsight` to back up + verify."
+        )
+    else:
+        rec_parts.append(f"You are on the latest version ({installed}).")
+
+    return {
+        "ok": True,
+        "installed": installed,
+        "latest": latest,
+        "update_available": update_available,
+        "compatibility": {
+            "status": severity,
+            "message": message,
+            "advisories": advisories,
+            "tested_against": manifest.get("tested_against", []),
+            "minimum_supported": manifest.get("minimum_supported_hindsight"),
+            "maximum_known_safe": manifest.get("maximum_known_safe_hindsight"),
+        },
+        "recommendation": " ".join(rec_parts),
+    }
+
+
+# ─── Tool: validate_compatibility ─────────────────────────────────────────────
+
+
+@mcp.tool()
+def validate_compatibility(target_version: str | None = None) -> dict[str, Any]:
+    """Pre-flight compatibility check before applying a Hindsight update.
+
+    Runs three probes:
+      1. CLI surface — does `hindsight-admin reindex-embeddings --help` still expose
+         the flags this MCP relies on (--auto-backup, --verify-recall, --bank, etc.)
+      2. Embedding column type discovery — does `reindex-embeddings --dry-run` succeed
+      3. API health — is Hindsight currently responsive
+
+    Args:
+        target_version: Optional. If passed, also looks up that version's status in
+            the published compat manifest.
+    """
+    probes: list[dict[str, Any]] = []
+    required_flags = [
+        "--auto-backup",
+        "--verify-recall",
+        "--bank",
+        "--schema",
+        "--batch-size",
+        "--skip-index-rebuild",
+        "--dry-run",
+        "--yes",
+    ]
+
+    # Probe 1: CLI surface
+    cmd_base: list[str]
+    admin = shutil.which("hindsight-admin")
+    if admin:
+        cmd_base = [admin]
+    else:
+        cmd_base = [sys.executable, "-m", "hindsight_api.admin.cli"]
+    try:
+        r = subprocess.run(cmd_base + ["reindex-embeddings", "--help"], capture_output=True, text=True, timeout=15)
+        help_text = r.stdout + r.stderr
+        missing = [f for f in required_flags if f not in help_text]
+        probes.append(
+            {
+                "name": "cli-surface",
+                "ok": len(missing) == 0,
+                "required_flags_present": [f for f in required_flags if f not in missing],
+                "missing_flags": missing,
+            }
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        probes.append({"name": "cli-surface", "ok": False, "error": repr(e)})
+
+    # Probe 2: dry-run reindex
+    try:
+        r = subprocess.run(
+            cmd_base + ["reindex-embeddings", "--dry-run", "--yes"], capture_output=True, text=True, timeout=60
+        )
+        probes.append(
+            {
+                "name": "dry-run-reindex",
+                "ok": r.returncode == 0,
+                "stdout_tail": (r.stdout or "")[-1000:],
+                "returncode": r.returncode,
+            }
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        probes.append({"name": "dry-run-reindex", "ok": False, "error": repr(e)})
+
+    # Probe 3: API health
+    try:
+        r = httpx.get(f"{_hindsight_url()}/health", timeout=3)
+        probes.append({"name": "api-health", "ok": r.status_code == 200, "status_code": r.status_code})
+    except httpx.HTTPError as e:
+        probes.append({"name": "api-health", "ok": False, "error": repr(e)})
+
+    # Manifest lookup if target_version specified
+    manifest_status: dict[str, Any] = {}
+    if target_version:
+        try:
+            r = httpx.get(COMPAT_MANIFEST_URL, timeout=8)
+            manifest = r.json() if r.status_code == 200 else {}
+            tested = [t for t in manifest.get("tested_against", []) if t.get("hindsight_version") == target_version]
+            manifest_status = {
+                "found_in_tested_list": bool(tested),
+                "tested_entry": tested[0] if tested else None,
+            }
+        except httpx.HTTPError as e:
+            manifest_status = {"error": repr(e)}
+
+    all_ok = all(p["ok"] for p in probes)
+    return {
+        "ok": all_ok,
+        "verdict": "compatible" if all_ok else "incompatible-or-degraded",
+        "probes": probes,
+        "manifest_status": manifest_status,
+        "recommendation": (
+            "All probes green. Safe to upgrade with `safe_upgrade_hindsight`."
+            if all_ok
+            else "One or more probes failed. Investigate before upgrading; running safe_upgrade_hindsight may break."
+        ),
+    }
+
+
+# ─── Tool: safe_upgrade_hindsight ─────────────────────────────────────────────
+
+
+@mcp.tool()
+def safe_upgrade_hindsight(
+    target_version: str | None = None,
+    backup_path: str = "./pre-upgrade-backup.zip",
+    skip_validation: bool = False,
+    rollback_on_failure: bool = True,
+) -> dict[str, Any]:
+    """Coordinated, reversible Hindsight upgrade with pre-flight + post-flight verification.
+
+    Workflow:
+      1. (Optional) validate_compatibility — abort if probes fail.
+      2. hindsight-admin backup → backup_path.
+      3. Record currently-installed Hindsight version.
+      4. pip install -U hindsight-api (or to a specific target_version if passed).
+      5. validate_compatibility again on the upgraded version.
+      6. If post-upgrade validation fails AND rollback_on_failure=True:
+         pip install hindsight-api==<previous_version> to roll back.
+         The user still has the backup_path zip if data was touched.
+
+    Args:
+        target_version: Optional pinned version (e.g., '0.5.5'). Defaults to latest.
+        backup_path: Where to write the pre-upgrade backup zip.
+        skip_validation: Skip the pre-flight validate_compatibility probes (not recommended).
+        rollback_on_failure: If post-upgrade validation fails, attempt pip rollback to previous.
+    """
+    actions: list[dict[str, Any]] = []
+    previous_version = _installed_hindsight_version()
+    actions.append({"step": "record-current-version", "version": previous_version})
+
+    # Step 1: pre-flight validation
+    if not skip_validation:
+        pre = validate_compatibility()
+        actions.append({"step": "pre-flight-validate", "ok": pre["ok"], "verdict": pre["verdict"]})
+        if not pre["ok"]:
+            return {
+                "ok": False,
+                "stage": "aborted-pre-flight",
+                "actions": actions,
+                "abort_reason": "Pre-flight validation failed; refusing to upgrade. "
+                "Pass skip_validation=true to override (not recommended).",
+                "pre_flight": pre,
+            }
+
+    # Step 2: backup
+    backup_cmd: list[str]
+    admin = shutil.which("hindsight-admin")
+    if admin:
+        backup_cmd = [admin, "backup", backup_path]
+    else:
+        backup_cmd = [sys.executable, "-m", "hindsight_api.admin.cli", "backup", backup_path]
+    try:
+        r = subprocess.run(backup_cmd, capture_output=True, text=True, timeout=600)
+        actions.append({"step": "backup", "ok": r.returncode == 0, "path": backup_path})
+        if r.returncode != 0:
+            return {"ok": False, "stage": "backup-failed", "actions": actions, "stderr": r.stderr[-500:]}
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        actions.append({"step": "backup", "ok": False, "error": repr(e)})
+        return {"ok": False, "stage": "backup-failed", "actions": actions}
+
+    # Step 3: pip upgrade
+    pkg_spec = f"hindsight-api=={target_version}" if target_version else "hindsight-api"
+    upgrade_flag = [] if target_version else ["-U"]
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "pip", "install", *upgrade_flag, pkg_spec],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        actions.append({"step": "pip-upgrade", "ok": r.returncode == 0, "stdout_tail": (r.stdout or "")[-500:]})
+        if r.returncode != 0:
+            return {
+                "ok": False,
+                "stage": "pip-upgrade-failed",
+                "actions": actions,
+                "stderr": (r.stderr or "")[-500:],
+            }
+    except subprocess.TimeoutExpired:
+        actions.append({"step": "pip-upgrade", "ok": False, "error": "timeout"})
+        return {"ok": False, "stage": "pip-upgrade-failed", "actions": actions}
+
+    new_version = _installed_hindsight_version()
+    actions.append({"step": "record-new-version", "version": new_version})
+
+    # Step 4: post-flight validation
+    post = validate_compatibility()
+    actions.append({"step": "post-flight-validate", "ok": post["ok"], "verdict": post["verdict"]})
+
+    if post["ok"]:
+        return {
+            "ok": True,
+            "stage": "upgraded-and-verified",
+            "previous_version": previous_version,
+            "new_version": new_version,
+            "backup_path": backup_path,
+            "actions": actions,
+        }
+
+    # Step 5: rollback
+    if rollback_on_failure and previous_version:
+        rollback = subprocess.run(
+            [sys.executable, "-m", "pip", "install", f"hindsight-api=={previous_version}"],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        actions.append({"step": "rollback", "ok": rollback.returncode == 0, "to_version": previous_version})
+        return {
+            "ok": False,
+            "stage": "rolled-back-after-post-flight-failure",
+            "previous_version": previous_version,
+            "attempted_version": new_version,
+            "backup_path": backup_path,
+            "actions": actions,
+            "post_flight": post,
+        }
+
+    return {
+        "ok": False,
+        "stage": "upgraded-but-post-flight-failed",
+        "previous_version": previous_version,
+        "new_version": new_version,
+        "backup_path": backup_path,
+        "actions": actions,
+        "post_flight": post,
+        "warning": "Hindsight is upgraded but post-flight validation failed. "
+        "Either restore from backup or pip install the previous version manually.",
     }
 
 
