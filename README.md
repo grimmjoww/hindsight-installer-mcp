@@ -100,9 +100,19 @@ When `mode: "pg0"`: no elevation ever — pg0 lives entirely in `~/.pg0/`, fully
 
 Hindsight has its own admin CLI ([`hindsight-admin`](https://github.com/vectorize-io/hindsight/blob/main/hindsight-api-slim/hindsight_api/admin/cli.py)). Some of these tools (`migrate_embeddings`, `verify_recall`) are thin wrappers around it. The pieces that *don't* belong upstream — extension install with elevation routing, env-file mutation, agent-friendly orchestration — live here. This MCP is the agent surface; upstream Hindsight is the engine.
 
-## Status
+## Status & maintenance
 
-**v0.1 — alpha.** Core install + upgrade workflows tested manually on Windows 11 + Postgres 17. PR welcome for Linux / macOS edge cases, additional extension installers, halfvec auto-detect.
+**v0.1 — alpha, lazily maintained.** Core install + upgrade workflows tested on Windows 11 + Postgres 17.
+
+This is a side-project glue layer between agents and Hindsight. I patch it when it bites me; PRs welcome but I'm not on a release schedule. If something breaks for you and there's no obvious fix:
+
+- Open an issue with full context (Hindsight version, OS, traceback)
+- I'll get to it eventually, but no SLA
+- Or fork it — MIT license, that's literally what it's for
+
+If Hindsight ever bumps a CLI flag that breaks `migrate_embeddings`, expect a patch within a week or two of me noticing. If you need an immediate fix, the wrapper is ~600 lines of single-file Python — easy to fork-and-patch.
+
+PRs welcome for: Linux / macOS edge cases, additional extension installers, halfvec auto-detect, gsudo-on-non-Windows, additional Hindsight workflow tools.
 
 ## License
 
