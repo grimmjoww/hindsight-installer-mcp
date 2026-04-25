@@ -90,6 +90,14 @@ install_extension(...) → uses gsudo if installed, falls back to native sudo
 [rest is identical]
 ```
 
+## Heads-up for users: one-time admin click
+
+If you're on **system Postgres** (i.e., installed via the EnterpriseDB installer at `C:\Program Files\PostgreSQL\...` on Windows, or `/usr/lib/postgresql/...` on Linux), expect **one UAC popup / sudo prompt the first time you install an extension** through this MCP. After that, gsudo (Windows) or sudo's cache (Linux/Mac) means no further prompts for the rest of your session.
+
+If you're on **pg0 mode** (`HINDSIGHT_API_DATABASE_URL=pg0`), there's **no admin prompt ever** — pg0 lives in your user dir.
+
+The MCP auto-detects which mode you're in via `detect_postgres_mode` and routes accordingly. Your agent should mention "I'm about to install <X>, you'll see one UAC prompt" before triggering it, so you're not caught off guard.
+
 ## Elevation handling
 
 When `mode: "system"` and `elevation_required: true`:
