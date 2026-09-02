@@ -1,31 +1,38 @@
 # hindsight-installer-mcp
 
-**MCP server for managing Postgres extensions and embedding pipelines on [Hindsight](https://github.com/vectorize-io/hindsight) — works with any MCP-compatible agent.**
+> Agent-safe tooling for Hindsight embedding migrations, Postgres extension management, compatibility checks, recall verification, backup, and rollback.
 
-Install vchord. Swap embedding models. Migrate indexes. Verify recall. All without admin gymnastics for users on `pg0` (embedded Postgres) mode, and with a single elevation prompt for users on system Postgres.
+`hindsight-installer-mcp` gives MCP-compatible agents a controlled way to maintain a [Hindsight](https://github.com/vectorize-io/hindsight) memory stack instead of asking a user to manually coordinate database changes, environment settings, re-embedding, and recovery.
 
-## Why
+## The problem it solves
 
-Hindsight is great. Upgrading its embedding pipeline (e.g., swapping `BAAI/bge-small-en-v1.5` for `Qwen/Qwen3-Embedding-4B`) requires a coordinated dance: stop the API, swap env vars, ALTER the embedding column dimension, install vector extensions like vchord if you exceed pgvector's 2000-dim HNSW limit, restart, re-embed every memory, verify recall didn't break. Doing that by hand is fiddly and error-prone. Doing it via your AI agent should be one prompt.
+Changing an embedding model in a populated memory system is not a one-line configuration edit. A safe migration can require the agent to detect the Postgres mode, install a vector extension, stop services, back up data, change dimensions, rebuild embeddings and indexes, verify recall, and roll back when a compatibility check fails.
 
-This server gives any MCP-compatible agent (Claude Code, Cursor, Cline, Continue, OpenAI Codex, Gemini CLI, custom Anthropic SDK clients, etc.) the tools to do it safely.
+This project turns that fragile sequence into inspectable MCP tools and orchestrated workflows.
 
-## What it does
+## What it provides
 
 | Tool | Purpose |
 |---|---|
-| `detect_postgres_mode` | Returns whether you're on pg0 (user-space, no admin) or system Postgres (admin needed); reports lib_dir / share_dir / data_dir |
-| `list_extensions` | What's currently installed in the Hindsight DB |
-| `install_extension` | Auto-routes to no-admin pg0 install OR elevated system install (gsudo / sudo) |
-| `uninstall_extension` | Remove an extension's files (after `DROP EXTENSION` in psql) |
-| `get_hindsight_env` / `set_hindsight_env` | Read or update Hindsight's `.env` |
-| `hindsight_status` | Is Hindsight running, what's the embedding column type, how many rows are embedded |
-| `migrate_embeddings` | Wraps `hindsight-admin reindex-embeddings` with optional auto-backup + verify-recall |
-| `verify_recall` | Standalone recall self-match sanity check |
-| `upgrade_embedding_pipeline` | Orchestrator: backup → set env → emit ALTER SQL → migrate → verify |
-| `check_hindsight_update` | Compare installed vs latest Hindsight, consult compat manifest, advise |
-| `validate_compatibility` | CLI surface + dry-run + API health probes before upgrading |
-| `safe_upgrade_hindsight` | Backup → pre-flight → pip upgrade → post-flight verify → rollback on failure |
+| `detect_postgres_mode` | Detect embedded `pg0` versus system Postgres and report the relevant directories and elevation requirements. |
+| `list_extensions` | Show extensions currently available to the Hindsight database. |
+| `install_extension` / `uninstall_extension` | Manage Postgres extension files with mode-aware elevation handling. |
+| `get_hindsight_env` / `set_hindsight_env` | Read and update Hindsight environment configuration. |
+| `hindsight_status` | Report service health, embedding-column type, and embedded-row state. |
+| `migrate_embeddings` | Run a reindex/re-embedding workflow with optional backup and recall verification. |
+| `verify_recall` | Run a standalone self-match sanity check after a migration. |
+| `upgrade_embedding_pipeline` | Coordinate backup, configuration, schema guidance, migration, and verification. |
+| `check_hindsight_update` | Compare the installed Hindsight version against the latest release and compatibility data. |
+| `validate_compatibility` | Probe required CLI surfaces, dry-run behavior, and API health before an upgrade. |
+| `safe_upgrade_hindsight` | Back up, validate, upgrade, verify, and roll back when post-flight checks fail. |
+
+## Why this is useful to agent builders
+
+- **Tool-level control:** each operation has a narrow purpose rather than giving an agent unrestricted shell access.
+- **Reversible workflows:** backups and rollback are part of the upgrade path, not an afterthought.
+- **Environment awareness:** the server adapts to `pg0` and system Postgres instead of assuming one installation layout.
+- **Evidence after action:** recall checks and compatibility probes give the agent something concrete to verify.
+- **Cross-client support:** the stdio MCP surface can be used by Claude Code, Cursor, Cline, Continue, Codex, Gemini CLI, and custom MCP clients.
 
 ## Install
 
@@ -35,11 +42,7 @@ pip install hindsight-installer-mcp
 uv add hindsight-installer-mcp
 ```
 
-## Use it from your agent
-
-### Claude Code (or any Claude Agent SDK client)
-
-In `~/.claude.json` or your project's MCP config:
+Register the command in the MCP configuration used by your agent host:
 
 ```json
 {
@@ -51,101 +54,55 @@ In `~/.claude.json` or your project's MCP config:
 }
 ```
 
-### Cursor / Continue / Cline / Codex / Gemini CLI
+## Example: embedding upgrade with vchord
 
-Whatever the host's MCP config syntax is, the command stays the same: `hindsight-installer-mcp`. It speaks standard stdio MCP. Any agent that lists `tools/list` and `tools/call` against an MCP server can use it.
+A user can ask an agent:
 
-## Example workflows
-
-### Upgrade Hindsight to Qwen3-Embedding-4B with vchord (Windows + pg0)
-
-```
-agent prompt: "Upgrade my Hindsight embedding to Qwen3-Embedding-4B at 2560 dim,
-              using vchord for the vector index. Backup first."
+```text
+Upgrade my Hindsight embedding model, use vchord for the vector index,
+back up the current state first, and verify recall after migration.
 ```
 
-The agent calls:
+A capable client can then call the narrow tools in sequence:
 
-```
-detect_postgres_mode()
-  → mode: "pg0", elevation_required: false
-install_extension(name="vchord", dll_or_so_path="...", sql_file_path="...", control_file_path="...")
-  → ok: true, no admin needed
-upgrade_embedding_pipeline(target_model="Qwen/Qwen3-Embedding-4B",
-                          target_dimension=2560,
-                          backup_path="./pre-upgrade.zip",
-                          use_vchord=true,
-                          trust_remote_code=true)
-  → returns ALTER SQL the user runs in psql
-migrate_embeddings(auto_backup_path="./pre-reembed.zip", verify_recall=true)
-  → re-embeds every memory, verifies 5/5 self-match
+```text
+detect_postgres_mode
+→ install_extension
+→ upgrade_embedding_pipeline
+→ migrate_embeddings
+→ verify_recall
 ```
 
-### Same thing on system Postgres (single elevation prompt)
+The exact database and schema actions still depend on the installed Hindsight and Postgres versions. The compatibility and dry-run tools exist to detect that boundary before the agent changes the system.
 
-```
-detect_postgres_mode() → mode: "system", elevation_required: true
-install_extension(...) → uses gsudo if installed, falls back to native sudo
-                         (Windows 11 24H2+ inline mode is best, gsudo cache mode also works)
-[rest is identical]
-```
+## Elevation model
 
-## Heads-up for users: one-time admin click
+- **`pg0` mode:** files live in the user directory, so extension installation does not require administrator access.
+- **System Postgres:** installation may require one UAC or `sudo` approval. On Windows the implementation prefers `gsudo`, then supported native `sudo` behavior, and fails clearly rather than hanging when non-interactive elevation is unavailable.
 
-If you're on **system Postgres** (i.e., installed via the EnterpriseDB installer at `C:\Program Files\PostgreSQL\...` on Windows, or `/usr/lib/postgresql/...` on Linux), expect **one UAC popup / sudo prompt the first time you install an extension** through this MCP. After that, gsudo (Windows) or sudo's cache (Linux/Mac) means no further prompts for the rest of your session.
+## Status
 
-If you're on **pg0 mode** (`HINDSIGHT_API_DATABASE_URL=pg0`), there's **no admin prompt ever** — pg0 lives in your user dir.
+**v0.2 alpha.** Core installation and upgrade paths were exercised on Windows 11 and PostgreSQL 17. This is a focused integration project, not a hosted service and not an SLA-backed product. Review the compatibility matrix and run the provided checks before using it against valuable data.
 
-The MCP auto-detects which mode you're in via `detect_postgres_mode` and routes accordingly. Your agent should mention "I'm about to install <X>, you'll see one UAC prompt" before triggering it, so you're not caught off guard.
+## Portfolio notes
 
-## Elevation handling
+This repository demonstrates:
 
-When `mode: "system"` and `elevation_required: true`:
+- MCP tool design for a real operational workflow;
+- state inspection before mutation;
+- human-elevation boundaries;
+- backup, validation, and rollback planning;
+- integration across an agent host, Hindsight, Postgres, vector extensions, and embedding providers;
+- documentation built around the failure modes encountered during implementation.
 
-- **Windows:** prefers `gsudo` ([gerardog/gsudo](https://github.com/gerardog/gsudo)) for cached-credential elevation; falls back to Windows 11 24H2+ native `sudo`. If neither is configured for non-interactive use, install fails with a clear message instead of hanging.
-- **Linux / macOS:** uses `sudo`. If no TTY is available and sudo isn't NOPASSWD-configured for your user, install fails with a clear message.
+The project was developed through an AI-assisted engineering workflow directed by **Willie Stewart / Phantom Horizon Studios**: defining the desired workflow and safety constraints, directing implementation, testing system behavior, diagnosing failures, and iterating on the integration and documentation.
 
-When `mode: "pg0"`: no elevation ever — pg0 lives entirely in `~/.pg0/`, fully user-writable.
+## Related projects
 
-## Why a separate MCP, not an upstream contribution
-
-Hindsight has its own admin CLI ([`hindsight-admin`](https://github.com/vectorize-io/hindsight/blob/main/hindsight-api-slim/hindsight_api/admin/cli.py)). Some of these tools (`migrate_embeddings`, `verify_recall`) are thin wrappers around it. The pieces that *don't* belong upstream — extension install with elevation routing, env-file mutation, agent-friendly orchestration — live here. This MCP is the agent surface; upstream Hindsight is the engine.
-
-## Safe-upgrade workflow
-
-When Hindsight ships a new version, your agent can do the whole "is this safe?" dance for you:
-
-```
-agent prompt: "Is there a Hindsight update? If so, upgrade safely."
-```
-
-1. `check_hindsight_update` — fetches latest from PyPI, consults the published [compat.json](./compat.json) matrix. Returns: status (ok / warn / block), advisories, recommendation.
-2. `validate_compatibility` — pre-flight probes: are the CLI flags this MCP relies on still present (`--auto-backup`, `--verify-recall`, etc.)? Does `reindex-embeddings --dry-run` succeed against your DB? Is the API healthy?
-3. `safe_upgrade_hindsight` — full reversible upgrade: backup → pre-flight → `pip install -U` → post-flight → if anything fails, `pip install old-version` rollback. Backup file remains regardless.
-
-The compat matrix lives in this repo at [compat.json](./compat.json) and is fetched from raw GitHub at runtime — so updates to "what's compatible" can be PR'd independently of MCP code releases.
-
-## Status & maintenance
-
-**v0.2 — alpha, lazily maintained.** Core install + upgrade workflows tested on Windows 11 + Postgres 17.
-
-This is a side-project glue layer between agents and Hindsight. I patch it when it bites me; PRs welcome but I'm not on a release schedule. If something breaks for you and there's no obvious fix:
-
-- Open an issue with full context (Hindsight version, OS, traceback)
-- I'll get to it eventually, but no SLA
-- Or fork it — MIT license, that's literally what it's for
-
-If Hindsight ever bumps a CLI flag that breaks `migrate_embeddings`, expect a patch within a week or two of me noticing. If you need an immediate fix, the wrapper is ~600 lines of single-file Python — easy to fork-and-patch.
-
-PRs welcome for: Linux / macOS edge cases, additional extension installers, halfvec auto-detect, gsudo-on-non-Windows, additional Hindsight workflow tools.
+- [vectorize-io/hindsight](https://github.com/vectorize-io/hindsight) — memory engine
+- [grimmjoww/vchord-windows-port](https://github.com/grimmjoww/vchord-windows-port) — Windows-native VectorChord build and Hindsight migration notes
+- [TensorChord/VectorChord](https://github.com/tensorchord/VectorChord) — vector index extension
 
 ## License
 
-MIT. Do whatever — this is glue between your agent and your Postgres install.
-
-## Related
-
-- [vectorize-io/hindsight](https://github.com/vectorize-io/hindsight) — the engine
-- [vectorize-io/hindsight#1258](https://github.com/vectorize-io/hindsight/pull/1258) — the `reindex-embeddings` admin command this MCP wraps
-- [grimmjoww/vchord-windows-port](https://github.com/grimmjoww/vchord-windows-port) — Windows-native vchord build (the canonical extension example)
-- [TensorChord/VectorChord](https://github.com/tensorchord/VectorChord) — the high-dimensional vector index extension
+MIT. Hindsight, VectorChord, and other dependencies retain their own licenses.
